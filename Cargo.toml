@@ -1,6 +1,6 @@
 [package]
 name = "nss_warlock"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Tristan Blackwell"]
 description = "NSS module for dynamic VM user resolution in Warlock infrastructure"
