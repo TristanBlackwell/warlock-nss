@@ -2,7 +2,6 @@ use lazy_static::lazy_static;
 use libc::{c_char, c_int, gid_t, passwd, size_t, uid_t};
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
-use std::ffi::CString;
 use std::hash::{Hash, Hasher};
 use std::ptr;
 
