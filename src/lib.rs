@@ -74,49 +74,94 @@ unsafe fn copy_string_to_buffer(
     Some(dest)
 }
 
-/// Fill a passwd struct for a VM user
+/// Fill a passwd struct for a VM user (UID derived from username)
 unsafe fn fill_passwd_struct(
     username: &str,
     pwd: *mut passwd,
     buffer: *mut c_char,
     buflen: size_t,
 ) -> c_int {
+    let mut errno_val: c_int = 0;
+    fill_passwd_struct_with_uid(
+        username,
+        generate_uid(username),
+        pwd,
+        buffer,
+        buflen,
+        &mut errno_val,
+    )
+}
+
+/// Fill a passwd struct for a VM user with an explicit UID
+unsafe fn fill_passwd_struct_with_uid(
+    username: &str,
+    uid: uid_t,
+    pwd: *mut passwd,
+    buffer: *mut c_char,
+    buflen: size_t,
+    errnop: *mut c_int,
+) -> c_int {
     let mut offset = 0;
 
     // Copy username
     let pw_name = match copy_string_to_buffer(username, buffer, buflen, &mut offset) {
         Some(ptr) => ptr,
-        None => return NSS_STATUS_TRYAGAIN,
+        None => {
+            if !errnop.is_null() {
+                *errnop = libc::ERANGE;
+            }
+            return NSS_STATUS_TRYAGAIN;
+        }
     };
 
     // Copy password placeholder
     let pw_passwd = match copy_string_to_buffer("x", buffer, buflen, &mut offset) {
         Some(ptr) => ptr,
-        None => return NSS_STATUS_TRYAGAIN,
+        None => {
+            if !errnop.is_null() {
+                *errnop = libc::ERANGE;
+            }
+            return NSS_STATUS_TRYAGAIN;
+        }
     };
 
     // Copy GECOS
     let pw_gecos = match copy_string_to_buffer(VM_GECOS, buffer, buflen, &mut offset) {
         Some(ptr) => ptr,
-        None => return NSS_STATUS_TRYAGAIN,
+        None => {
+            if !errnop.is_null() {
+                *errnop = libc::ERANGE;
+            }
+            return NSS_STATUS_TRYAGAIN;
+        }
     };
 
     // Copy home directory
     let pw_dir = match copy_string_to_buffer(VM_HOME, buffer, buflen, &mut offset) {
         Some(ptr) => ptr,
-        None => return NSS_STATUS_TRYAGAIN,
+        None => {
+            if !errnop.is_null() {
+                *errnop = libc::ERANGE;
+            }
+            return NSS_STATUS_TRYAGAIN;
+        }
     };
 
     // Copy shell
     let pw_shell = match copy_string_to_buffer(VM_SHELL, buffer, buflen, &mut offset) {
         Some(ptr) => ptr,
-        None => return NSS_STATUS_TRYAGAIN,
+        None => {
+            if !errnop.is_null() {
+                *errnop = libc::ERANGE;
+            }
+            return NSS_STATUS_TRYAGAIN;
+        }
     };
 
     // Fill passwd struct
     (*pwd).pw_name = pw_name;
     (*pwd).pw_passwd = pw_passwd;
-    (*pwd).pw_uid = generate_uid(username);
+    (*pwd).pw_uid = uid;
     (*pwd).pw_gid = DEFAULT_GID;
     (*pwd).pw_gecos = pw_gecos;
     (*pwd).pw_dir = pw_dir;
@@ -161,19 +206,27 @@ pub unsafe extern "C" fn _nss_warlock_getpwnam_r(
 
 /// NSS function: Look up user by UID
 ///
-/// This is called by getpwuid() for reverse lookups
-/// Since we can't reverse the hash, we return NOTFOUND
+/// This is called by getpwuid() for reverse lookups.
+/// Since we can't reverse the hash to recover the original VM username,
+/// we return a synthetic entry for any UID in our range (5000-65000).
+/// This is needed because SSH and bash call getpwuid() to resolve the
+/// current user, and failing to find an entry causes fatal errors.
 #[no_mangle]
 pub unsafe extern "C" fn _nss_warlock_getpwuid_r(
-    _uid: uid_t,
-    _pwd: *mut passwd,
-    _buffer: *mut c_char,
-    _buflen: size_t,
-    _errnop: *mut c_int,
+    uid: uid_t,
+    pwd: *mut passwd,
+    buffer: *mut c_char,
+    buflen: size_t,
+    errnop: *mut c_int,
 ) -> c_int {
-    // We can't reverse-lookup VM users from UID
-    // This is acceptable for our use case
-    NSS_STATUS_NOTFOUND
+    // Only handle UIDs in our allocated range
+    if uid < UID_MIN || uid >= UID_MIN + UID_RANGE {
+        return NSS_STATUS_NOTFOUND;
+    }
+
+    // Generate a synthetic username since we can't reverse the hash
+    let synthetic_name = format!("vm-uid-{}", uid);
+    fill_passwd_struct_with_uid(&synthetic_name, uid, pwd, buffer, buflen, errnop)
 }
 
 /// NSS function: Initialize enumeration of users
@@ -272,6 +325,62 @@ mod tests {
                 username,
                 UID_MIN,
                 UID_MIN + UID_RANGE - 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_uid_in_range_returns_entry() {
+        // A UID in the VM range (5000-65000) should return a synthetic entry
+        let uid: uid_t = 20000;
+        let mut pwd: passwd = unsafe { std::mem::zeroed() };
+        let mut buffer = vec![0i8; 1024];
+        let mut errnop: c_int = 0;
+
+        let result = unsafe {
+            _nss_warlock_getpwuid_r(
+                uid,
+                &mut pwd,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut errnop,
+            )
+        };
+
+        assert_eq!(
+            result, NSS_STATUS_SUCCESS,
+            "UID in range should return SUCCESS"
+        );
+        assert_eq!(pwd.pw_uid, uid);
+
+        let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+            .to_str()
+            .unwrap();
+        assert_eq!(name, "vm-uid-20000");
+    }
+
+    #[test]
+    fn test_uid_out_of_range_returns_notfound() {
+        // A UID outside the VM range should return NOTFOUND
+        for uid in &[0u32, 1000, 4999, 65000, 65535] {
+            let mut pwd: passwd = unsafe { std::mem::zeroed() };
+            let mut buffer = vec![0i8; 1024];
+            let mut errnop: c_int = 0;
+
+            let result = unsafe {
+                _nss_warlock_getpwuid_r(
+                    *uid,
+                    &mut pwd,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut errnop,
+                )
+            };
+
+            assert_eq!(
+                result, NSS_STATUS_NOTFOUND,
+                "UID {} should return NOTFOUND",
+                uid
             );
         }
     }
